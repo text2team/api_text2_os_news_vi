@@ -1,10 +1,12 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
 import time
 import re
 import urllib.request
 import json
+import asyncio
 
 app = FastAPI()
 
@@ -139,15 +141,100 @@ def detect_region(request: Request, country_param: str = None) -> str:
     country = get_country_from_ip(ip)
     return "VN" if country == "VN" else "INTL"
 
+async def fetch_source_articles(source: str, url: str) -> tuple:
+    try:
+        # Run feedparser.parse in a separate thread so it doesn't block the asyncio event loop
+        feed = await asyncio.to_thread(feedparser.parse, url)
+        
+        channel_avatar = ""
+        if 'image' in feed.feed and 'href' in feed.feed.image:
+            channel_avatar = feed.feed.image.href
+        else:
+            channel_avatar = SOURCE_LOGOS.get(source, "https://text-2.com/media/thumnel.png")
+            
+        articles = []
+        for entry in feed.entries[:15]:
+            image_url = ""
+            
+            # 1. Standard media tag scanning
+            if 'media_content' in entry and len(entry.media_content) > 0:
+                image_url = entry.media_content[0].get('url', '')
+            elif 'media_thumbnail' in entry and len(entry.media_thumbnail) > 0:
+                image_url = entry.media_thumbnail[0].get('url', '')
+                
+            # 2. Enclosure tag scanning
+            if not image_url and 'links' in entry:
+                for link in entry.links:
+                    if link.get('rel') == 'enclosure' and (
+                        'image' in link.get('type', '').lower() or 
+                        link.get('href', '').lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif'))
+                    ):
+                        image_url = link.get('href', '')
+                        break
+                        
+            # 3. Rare direct image tag
+            if not image_url and 'image' in entry and 'href' in getattr(entry, 'image', {}):
+                image_url = entry.image.href
+                
+            # 4. Regex HTML fallback scanning
+            if not image_url:
+                html_content = entry.get("summary", "")
+                if "content" in entry and len(entry.content) > 0:
+                    html_content += entry.content[0].get("value", "")
+                if "description" in entry:
+                    html_content += entry.get("description", "")
+                    
+                match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
+                if match:
+                    image_url = match.group(1)
+                    
+            # 5. Default placeholder image
+            if not image_url:
+                image_url = "https://text-2.com/assets/default-news.jpg"
+                
+            articles.append({
+                "title": entry.title,
+                "link": entry.link,
+                "image": image_url,
+                "source": source,
+                "source_avatar": channel_avatar,
+                "published": entry.get("published", "")
+            })
+        return source, articles
+    except Exception as e:
+        print(f"Error parsing RSS source {source}: {e}")
+        return source, []
+
+async def feed_generator(feeds_to_parse: dict, region: str):
+    tasks = [fetch_source_articles(source, url) for source, url in feeds_to_parse.items()]
+    all_articles = []
+    
+    for future in asyncio.as_completed(tasks):
+        try:
+            source, articles = await future
+            if articles:
+                all_articles.extend(articles)
+                # Yield this chunk as a single line JSON chunk
+                yield json.dumps({"status": "progress", "source": source, "data": articles}, ensure_ascii=False) + "\n"
+        except Exception as e:
+            print(f"Error in stream fetch: {e}")
+            
+    # Update RAM cache at the end of the stream
+    if all_articles:
+        cache[region]["data"] = all_articles
+        cache[region]["last_updated"] = time.time()
+        
+    yield json.dumps({"status": "done"}, ensure_ascii=False) + "\n"
+
 @app.get("/api/news")
-def get_news(request: Request, country: str = None):
+async def get_news(request: Request, country: str = None, stream: bool = False):
     region = detect_region(request, country)
     current_time = time.time()
     
     region_cache = cache[region]
     
-    # Return RAM Cache if valid (5 minutes)
-    if current_time - region_cache["last_updated"] < CACHE_TIME and region_cache["data"]:
+    # Return RAM Cache if valid (5 minutes) and not streaming
+    if not stream and current_time - region_cache["last_updated"] < CACHE_TIME and region_cache["data"]:
         return {
             "status": "success", 
             "source": f"RAM Cache ({region} - Siêu tốc)", 
@@ -155,76 +242,29 @@ def get_news(request: Request, country: str = None):
         }
         
     feeds_to_parse = VIETNAM_FEEDS if region == "VN" else INTERNATIONAL_FEEDS
-    news_data = []
     
-    for source, url in feeds_to_parse.items():
-        try:
-            feed = feedparser.parse(url)
-            
-            # Channel avatar / logo extraction with custom logo mapping fallback
-            channel_avatar = ""
-            if 'image' in feed.feed and 'href' in feed.feed.image:
-                channel_avatar = feed.feed.image.href
-            else:
-                channel_avatar = SOURCE_LOGOS.get(source, "https://text-2.com/media/thumnel.png")
-
-            # Extract up to 15 entries per source
-            for entry in feed.entries[:15]:
-                image_url = ""
-                
-                # 1. Standard media tag scanning
-                if 'media_content' in entry and len(entry.media_content) > 0:
-                    image_url = entry.media_content[0].get('url', '')
-                elif 'media_thumbnail' in entry and len(entry.media_thumbnail) > 0:
-                    image_url = entry.media_thumbnail[0].get('url', '')
-                    
-                # 2. Enclosure tag scanning
-                if not image_url and 'links' in entry:
-                    for link in entry.links:
-                        if link.get('rel') == 'enclosure' and (
-                            'image' in link.get('type', '').lower() or 
-                            link.get('href', '').lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif'))
-                        ):
-                            image_url = link.get('href', '')
-                            break
-                
-                # 3. Rare direct image tag
-                if not image_url and 'image' in entry and 'href' in getattr(entry, 'image', {}):
-                    image_url = entry.image.href
-                            
-                # 4. Regex HTML fallback scanning (NPR, FT, WSJ, VnExpress, Tuổi Trẻ, etc.)
-                if not image_url:
-                    html_content = entry.get("summary", "")
-                    if "content" in entry and len(entry.content) > 0:
-                        html_content += entry.content[0].get("value", "")
-                    if "description" in entry:
-                        html_content += entry.get("description", "")
-                        
-                    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
-                    if match:
-                        image_url = match.group(1)
-                
-                # 5. Default placeholder image
-                if not image_url:
-                    image_url = "https://text-2.com/assets/default-news.jpg" 
-
-                news_data.append({
-                    "title": entry.title,
-                    "link": entry.link,
-                    "image": image_url,
-                    "source": source,
-                    "source_avatar": channel_avatar,
-                    "published": entry.get("published", "")
-                })
-        except Exception as e:
-            print(f"Error parsing RSS source {source}: {e}")
-            
-    # Update cache
-    region_cache["data"] = news_data
-    region_cache["last_updated"] = current_time
+    if stream:
+        return StreamingResponse(
+            feed_generator(feeds_to_parse, region),
+            media_type="application/x-ndjson"
+        )
+    else:
+        # Fast concurrent fetch for standard requests
+        tasks = [fetch_source_articles(source, url) for source, url in feeds_to_parse.items()]
+        results = await asyncio.gather(*tasks)
         
-    return {
-        "status": "success", 
-        "source": f"Cào Live Mới Nhất ({region})", 
-        "data": news_data
-    }
+        news_data = []
+        for source, articles in results:
+            if articles:
+                news_data.extend(articles)
+                
+        # Update cache
+        if news_data:
+            cache[region]["data"] = news_data
+            cache[region]["last_updated"] = current_time
+            
+        return {
+            "status": "success", 
+            "source": f"Cào Live Nhanh ({region})", 
+            "data": news_data
+        }
